@@ -1,0 +1,17 @@
+# raw datasets (published as release data-v1, see README)
+NASA_RAW/
+OXFORD_RAW/
+data/
+*.zip
+
+# helper experiments (not part of the submission)
+eksperymenty/
+warwick_explorer_old.py
+
+# generated results
+results/
+*.png
+__pycache__/
+*.pyc
+.vscode/
+.idea/
