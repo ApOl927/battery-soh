@@ -17,3 +17,7 @@ __pycache__/
 .idea/
 
 lessons/
+
+repo_all*.txt
+wyniki_*.txt
+_test_ox.mat
