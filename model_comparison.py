@@ -5,8 +5,9 @@ All models get identical data: the same windows (10 cycles -> SoH 20 cycles late
 the same features, the same scaler and the same Oxford test cells.
 Only the model and the training data differ.
 
-  LSTM_pretrained     thesis model: pre-trained on NASA, last layer re-trained on 2 Oxford cells
+  LSTM_pretrained     former thesis model: pre-trained on NASA, last layer retrained on 2 Oxford cells
   LSTM_oxford_only    the same network trained from scratch on the 2 Oxford cells only
+                      (with --no_cycle this is the thesis model from lstm_cross_val.py)
   LSTM_random_frozen  like LSTM_pretrained, but random weights instead of NASA pre-training
   RF_nasa_oxford      Random Forest trained on NASA + Warwick + the same 2 Oxford cells
   RF_oxford_only      Random Forest trained on the 2 Oxford cells only
@@ -38,6 +39,17 @@ from sklearn.preprocessing import MinMaxScaler, PolynomialFeatures
 
 # the LSTM, its settings and helpers are taken from lstm_cross_val.py. Then both files use the same model
 import lstm_cross_val as L
+
+# All features used in the comparison: the thesis model's features + discharge_cycle.
+# Variants without the cycle number are run with --no_cycle.
+FEATURES = ["discharge_cycle"] + [c for c in L.FEATURE_COLUMNS if c != "discharge_cycle"]
+
+#Two-phase training of the LSTM_pretrained variant (pre-training on NASA + the last layer on Oxford)
+# LSTM_oxford_only uses PRETRAIN_LR and FINETUNE_EPOCHS, the same values as lstm_cross_val.py
+PRETRAIN_EPOCHS = 150
+PRETRAIN_LR = 0.001
+FINETUNE_EPOCHS = 50
+FINETUNE_LR = 0.0001
 
 ALL_MODELS = ["LSTM_pretrained", "LSTM_oxford_only", "LSTM_random_frozen",
               "RF_nasa_oxford", "RF_oxford_only", "RF_no_oxford", "cycle_only"]
@@ -128,19 +140,19 @@ def run_lstm(P: dict, seed: int, mode: str) -> np.ndarray:
     crit = nn.MSELoss()
     # phase 1 only for 'transfer': train the whole network on pre-training windows
     if mode == "transfer":
-        opt = torch.optim.Adam(model.parameters(), lr=L.PRETRAIN_LR)
-        for _ in range(L.PRETRAIN_EPOCHS):
+        opt = torch.optim.Adam(model.parameters(), lr=PRETRAIN_LR)
+        for _ in range(PRETRAIN_EPOCHS):
             L._run_epoch(model, pre_loader, crit, opt)
     # 'transfer' and 'random': LSTM frozen, only the last linear layer learns
     if mode in ("transfer", "random"):
         for p in model.lstm.parameters():
             p.requires_grad = False
         model.lstm.eval()
-        opt = torch.optim.Adam(model.fc.parameters(), lr=L.FINETUNE_LR)
+        opt = torch.optim.Adam(model.fc.parameters(), lr=FINETUNE_LR)
     else:  # ox_only
-        opt = torch.optim.Adam(model.parameters(), lr=L.PRETRAIN_LR)
+        opt = torch.optim.Adam(model.parameters(), lr=PRETRAIN_LR)
     # phase 2: training on the 2 Oxford cells
-    for _ in range(L.FINETUNE_EPOCHS):
+    for _ in range(FINETUNE_EPOCHS):
         L._run_epoch(model, ft_loader, crit, opt)
     #predict the test windows in parts of 4096
     model.eval()
@@ -181,7 +193,7 @@ def main() -> None:
     args = ap.parse_args()
 
     # --no_cycle: no discharge_cycle feature. cycle_only makes no sense and skipped
-    feats = [c for c in L.FEATURE_COLUMNS if not (args.no_cycle and c == "discharge_cycle")]
+    feats = [c for c in FEATURES if not (args.no_cycle and c == "discharge_cycle")]
     variants = [v for v in args.models if not (args.no_cycle and v == "cycle_only")]
 
     df = load_master()
