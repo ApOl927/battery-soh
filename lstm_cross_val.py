@@ -1,19 +1,17 @@
 """
-LSTM cross val - the main LSTM model of the thesis, with transfer learning.
-Sections 3.4 (network, input windows) and 3.5 (two-phase training).
+LSTM cross val - the main LSTM model of the thesis.
+Sections 3.4 (network, input windows) and 3.5 (training and comparison).
 
-  input:    10 discharge cycles in a row of one cell, 7 features (table in 3.4)
-  target:   SoH 20 cycles after the window (future state, not the current one)
+  input:    10 discharge cycles in a row of one cell 6 features (table in 3.4)
+  target:   SoH 21 cycles after the last cycle of the window (future state, not current one)
   network:  2 LSTM layers x 64, dropout 0.2, one linear layer at the end
 
-  phase 1   pre-training on NASA + Warwick (in practice only NASA windows are left:
-            Warwick cycle numbers go in steps of 20, so all its windows are dropped)
-  phase 2   LSTM layers frozen, only the last linear layer is trained
-            on the 2 Oxford cells with the lowest SoH
-  test     the other 6 Oxford cells
+  training whole network on the 2 Oxford cells with the lowest SoH
+            (no pre-training on NASA and no discharge_cycle -> see section 3.5 and model_comparison.py)
+  test      the other 6 Oxford cells
 
 Input:  output/MASTER_processed.csv
-Output: metrics in the terminal + lstm_transfer_plot.png
+Output: metrics in the terminal + lstm_plot.png
 Run:    python lstm_cross_val.py
 """
 
@@ -37,9 +35,9 @@ random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
-# the 7 input features (table in section 3.4)
+# the 6 input features (table in section 3.4)
+# discharge_cycle is not a feature. It means something different in each dataset (sections 3.3 and 3.5)
 FEATURE_COLUMNS: list[str] = [
-    "discharge_cycle",
     "avg_temperature_c",
     "resistance_ratio",
     "nominal_capacity",
@@ -47,9 +45,7 @@ FEATURE_COLUMNS: list[str] = [
     "temp_variance",
     "voltage_variance",
 ]
-
-# without discharge_cycle R2 drops 0.874 -> 0.583 (section 3.4) so it must stay
-assert "discharge_cycle" in FEATURE_COLUMNS, "Temporal embedding: discharge_cycle must stay in FEATURE_COLUMNS."
+assert "discharge_cycle" not in FEATURE_COLUMNS, "discharge_cycle must not be a model feature (section 3.5)."
 
 # rows with an empty value in these columns are dropped
 _BASE_FEATURE_COLS: list[str] = [
@@ -66,11 +62,9 @@ WINDOW_SIZE: int = 10
 TARGET_HORIZON: int = 20
 BATCH_SIZE: int = 64
 
-# phase 1: long training; phase 2: short training with a 10x smaller learning rate
-PRETRAIN_EPOCHS: int = 150
-PRETRAIN_LR: float = 0.001
-FINETUNE_EPOCHS: int = 50
-FINETUNE_LR: float = 0.0001
+#training on the 2 Oxford cells: Adam; 50 epochs, learning rate 0.001
+EPOCHS: int = 50
+LEARNING_RATE: float = 0.001
 
 # network size: 2 LSTM layers x 64 neurons, dropout 0.2 between them (section 3.4)
 LSTM_HIDDEN_SIZE: int = 64
@@ -173,7 +167,7 @@ def _run_epoch(
     train_mode = optimizer is not None
     if train_mode:
         model.train()
-        # LSTM frozen (phase 2) -> keep it in eval mode then dropout stays off
+        # LSTM frozen (used by model_comparison.py) -> keep it in eval mode. Dropout stays off
         lstm_has_grad = any(p.requires_grad for p in model.lstm.parameters())
         if not lstm_has_grad:
             model.lstm.eval()
@@ -213,7 +207,8 @@ def main() -> None:
     min_soh_by_cell = oxford_df.groupby("battery_id", sort=False)["soh_percentage"].min()
     adapt_min_soh = {bid: float(min_soh_by_cell[bid]) for bid in adapt_ids}
 
-    # train = NASA + Warwick + 2 Oxford cells, test = the other 6 Oxford cells
+    # NASA + Warwick + 2 Oxford cells -> to fit the scaler (it's same preprocessing as in model_comparison.py)
+    # network is trained on the 2 Oxford cells only; test = other 6 Oxford cells
     df_train = pd.concat(
         [
             df[src.isin(("NASA", "WARWICK"))].copy(),
@@ -247,34 +242,25 @@ def main() -> None:
     df_test.loc[:, [TARGET_COLUMN]] = target_scaler.transform(df_test[[TARGET_COLUMN]])
 
     src_tr = df_train["dataset_source"].astype(str).str.upper()
-    # phase 1 data: NASA + Warwick, no Oxford
-    df_pretrain = df_train[src_tr.isin(("NASA", "WARWICK"))].copy()
-    # phase 2 data: only the 2 Oxford cells
-    df_finetune = df_train[(src_tr == "OXFORD") & (df_train["battery_id"].isin(adapt_ids))].copy()
+    # training data: only the 2 Oxford cells
+    df_ox_train = df_train[(src_tr == "OXFORD") & (df_train["battery_id"].isin(adapt_ids))].copy()
 
-    # Warwick gives 0 windows (cycle step 20), so pre-training is NASA only. it has 1304windows
-    X_pre_np, y_pre_np = create_sequences(df_pretrain, window_size=WINDOW_SIZE)
-    X_ft_np, y_ft_np = create_sequences(df_finetune, window_size=WINDOW_SIZE)
+    X_tr_np, y_tr_np = create_sequences(df_ox_train, window_size=WINDOW_SIZE)
     X_test_np, y_test_np = create_sequences(df_test, window_size=WINDOW_SIZE)
 
-    if X_pre_np.shape[0] == 0:
-        raise RuntimeError("No pre-train sequences (NASA + Warwick).")
-    if X_ft_np.shape[0] == 0:
-        raise RuntimeError("No fine-tune sequences (Oxford adaptation cells).")
+    if X_tr_np.shape[0] == 0:
+        raise RuntimeError("No training sequences (Oxford training cells).")
     if X_test_np.shape[0] == 0:
         raise RuntimeError("No test sequences.")
 
     # numpy -> torch tensors
-    X_pre = torch.tensor(X_pre_np, dtype=torch.float32)
-    y_pre = torch.tensor(y_pre_np, dtype=torch.float32)
-    X_ft = torch.tensor(X_ft_np, dtype=torch.float32)
-    y_ft = torch.tensor(y_ft_np, dtype=torch.float32)
+    X_tr = torch.tensor(X_tr_np, dtype=torch.float32)
+    y_tr = torch.tensor(y_tr_np, dtype=torch.float32)
     X_test = torch.tensor(X_test_np, dtype=torch.float32)
     y_test = torch.tensor(y_test_np, dtype=torch.float32)
 
     # batches of 64 windows, mixed in a new order every epoch
-    pre_loader = DataLoader(TensorDataset(X_pre, y_pre), batch_size=BATCH_SIZE, shuffle=True)
-    ft_loader = DataLoader(TensorDataset(X_ft, y_ft), batch_size=BATCH_SIZE, shuffle=True)
+    train_loader = DataLoader(TensorDataset(X_tr, y_tr), batch_size=BATCH_SIZE, shuffle=True)
 
     input_size = len(FEATURE_COLUMNS)
     model = LSTMRegressor(
@@ -286,29 +272,13 @@ def main() -> None:
     # loss = mean squared error on the scaled SoH
     criterion = nn.MSELoss()
 
-    # --- phase 1: train the whole network ---
-    optimizer_pre = torch.optim.Adam(model.parameters(), lr=PRETRAIN_LR)
-
-    print(f"Phase 1 — pre-train (NASA + Warwick only): {len(y_pre_np)} sequences, {PRETRAIN_EPOCHS} epochs, lr={PRETRAIN_LR}")
-    for epoch in range(PRETRAIN_EPOCHS):
-        avg_loss = _run_epoch(model, pre_loader, criterion, optimizer_pre)
-        if epoch == 0 or (epoch + 1) % 30 == 0:
-            print(f"  Pre-train epoch {epoch + 1:03d}/{PRETRAIN_EPOCHS} - loss: {avg_loss:.4f}")
-
-    # --- phase 2: freeze the LSTM layers, train only the last linear layer on 2 Oxford cells ---
-    for p in model.lstm.parameters():
-        p.requires_grad = False
-    model.lstm.eval()
-    optimizer_ft = torch.optim.Adam(model.fc.parameters(), lr=FINETUNE_LR)
-
-    print(
-        f"\nPhase 2 — fine-tune (frozen LSTM, train fc only): {len(y_ft_np)} sequences, "
-        f"{FINETUNE_EPOCHS} epochs, lr={FINETUNE_LR}"
-    )
-    for epoch in range(FINETUNE_EPOCHS):
-        avg_loss = _run_epoch(model, ft_loader, criterion, optimizer_ft)
+    # train whole network on the 2 Oxford cells
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    print(f"Training (2 Oxford cells, whole network): {len(y_tr_np)} sequences, {EPOCHS} epochs, lr={LEARNING_RATE}")
+    for epoch in range(EPOCHS):
+        avg_loss = _run_epoch(model, train_loader, criterion, optimizer)
         if epoch == 0 or (epoch + 1) % 10 == 0:
-            print(f"  Fine-tune epoch {epoch + 1:02d}/{FINETUNE_EPOCHS} - loss: {avg_loss:.4f}")
+            print(f"  Epoch {epoch + 1:02d}/{EPOCHS} - loss: {avg_loss:.4f}")
 
     # test on the held-out Oxford cells, no training here
     test_loader = DataLoader(TensorDataset(X_test, y_test), batch_size=BATCH_SIZE, shuffle=False)
@@ -331,12 +301,9 @@ def main() -> None:
     mae = float(mean_absolute_error(y_true, y_pred))
     r2 = float(r2_score(y_true, y_pred))
 
-    print("\nLSTM transfer learning: pre-train NASA+Warwick -> fine-tune 2 Oxford -> test held-out Oxford")
-    print(f"  Oxford adaptation batteries (lowest min SoH): {adapt_ids}  min SoH: {adapt_min_soh}")
-    print(
-        f"  Pre-train sequences: {len(y_pre_np)} | Fine-tune sequences: {len(y_ft_np)} | "
-        f"Test sequences: {len(y_test_np)}"
-    )
+    print("\nLSTM: train on 2 Oxford cells -> test on the other Oxford cells")
+    print(f"  Oxford training cells (lowest min SoH): {adapt_ids}  min SoH: {adapt_min_soh}")
+    print(f"  Training sequences: {len(y_tr_np)} | Test sequences: {len(y_test_np)}")
     print(f"  RMSE: {rmse:.4f}")
     print(f"  MAE:  {mae:.4f}")
     print(f"  R^2:  {r2:.4f}")
@@ -345,8 +312,8 @@ def main() -> None:
     fig, ax = plt.subplots(figsize=(7, 7))
     ax.scatter(y_true, y_pred, alpha=0.15, s=8, edgecolors="none")
     ax.set_xlabel("Actual SoH (Oxford held-out) [%]")
-    ax.set_ylabel("Predicted SoH (LSTM transfer) [%]")
-    ax.set_title("Pre-train NASA+Warwick, fine-tune 2 Oxford cells, test remaining Oxford")
+    ax.set_ylabel("Predicted SoH (LSTM) [%]")
+    ax.set_title("LSTM trained on 2 Oxford cells, test on the other Oxford cells")
     lo = float(min(np.min(y_true), np.min(y_pred)))
     hi = float(max(np.max(y_true), np.max(y_pred)))
     ax.plot([lo, hi], [lo, hi], "r--", linewidth=1.5, label="y = x (perfect)")
@@ -354,7 +321,7 @@ def main() -> None:
     ax.grid(True, alpha=0.3)
     ax.set_aspect("equal", adjustable="box")
 
-    out_png = root / "lstm_transfer_plot.png"
+    out_png = root / "lstm_plot.png"
     plt.tight_layout()
     plt.savefig(out_png, dpi=150, bbox_inches="tight")
     plt.close(fig)
